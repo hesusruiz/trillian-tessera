@@ -206,7 +206,7 @@ Here's an example of creating an `Appender` for the POSIX driver:
 
 See the documentation for each driver implementation to understand the parameters that each takes.
 
-The final part of configuring Tessera is to set up the addition features that you want to use.
+The final part of configuring Tessera is to set up the additional features that you want to use.
 These optional libraries can be used to provide common log behaviours.
 See [Features](#features) after reading the rest of this section for more details.
 
@@ -275,7 +275,7 @@ The antispam mechanism consists of two layers which sit in front of the underlyi
    entry, and if such a record exists, it will short-circuit the addition of the duplicate entry and return a previous
    version's assigned position in the log.
 
-These layes are configured by the `WithAntispam` method of the
+These layers are configured by the `WithAntispam` method of the
 [AppendOptions](https://pkg.go.dev/github.com/transparency-dev/tessera@main#AppendOptions.WithAntispam) and
 [MigrateOptions](https://pkg.go.dev/github.com/transparency-dev/tessera@main#AppendOptions.WithAntispam).
 
@@ -342,7 +342,7 @@ and configured using the [`tessera.NewMigratonOptions`](https://pkg.go.dev/githu
 >    * You're migrating between/to/from cloud providers for some reason.
 >    * You're "freezing" your log, and want to move it to a cheap read-only location.
 >
-> You can also use this mode to migrate a [tlog-tiles][] compliant log _into_ Tessera.
+> You can also use this mode to migrate a [tlog-tiles][https://c2sp.org/tlog-tiles] compliant log _into_ Tessera.
 
 Binaries for migrating _into_ each of the storage implementations can be found at [./cmd/experimental/migrate/](./cmd/experimental/migrate/).
 These binaries take the URL of a remote tiled log, and copy it into the target location.
