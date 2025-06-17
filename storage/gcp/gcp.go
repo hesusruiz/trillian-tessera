@@ -55,6 +55,7 @@ import (
 	"github.com/transparency-dev/tessera/api/layout"
 	"github.com/transparency-dev/tessera/internal/migrate"
 	"github.com/transparency-dev/tessera/internal/otel"
+	"github.com/transparency-dev/tessera/internal/parse"
 	"github.com/transparency-dev/tessera/internal/stream"
 	storage "github.com/transparency-dev/tessera/storage/internal"
 	"golang.org/x/sync/errgroup"
@@ -110,8 +111,10 @@ type sequencer interface {
 	currentTree(ctx context.Context) (uint64, []byte, error)
 	// nextIndex returns the next available index in the log.
 	nextIndex(ctx context.Context) (uint64, error)
-	// publishTree coordinates the publication of new checkpoints based on the current integrated tree.
-	publishTree(ctx context.Context, minAge time.Duration, f func(ctx context.Context, size uint64, root []byte) error) error
+	// publishCheckpoint coordinates the publication of new checkpoints based on the current integrated tree.
+	publishCheckpoint(ctx context.Context, minAge time.Duration, f func(ctx context.Context, size uint64, root []byte) error) error
+	// garbageCollect coordinates the removal of unneeded partial tiles/entry bundles for the provided tree size, up to a maximum number of deletes per invocation.
+	garbageCollect(ctx context.Context, treeSize uint64, maxDeletes uint, removePrefix func(ctx context.Context, prefix string) error) error
 }
 
 // consumeFunc is the signature of a function which can consume entries from the sequencer and integrate
@@ -196,15 +199,16 @@ func (lr *LogReader) StreamEntries(ctx context.Context, startEntry, N uint64) it
 	return stream.EntryBundles(ctx, numWorkers, lr.integratedSize, lr.lrs.getEntryBundle, startEntry, N)
 }
 
+// Appender creates a new tessera.Appender lifecycle object.
 func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*tessera.Appender, tessera.LogReader, error) {
-
-	if opts.CheckpointInterval() < minCheckpointInterval {
-		return nil, nil, fmt.Errorf("requested CheckpointInterval (%v) is less than minimum permitted %v", opts.CheckpointInterval(), minCheckpointInterval)
-	}
-
 	c, err := gcs.NewClient(ctx, gcs.WithJSONReads())
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create GCS client: %v", err)
+	}
+	gs := &gcsStorage{
+		gcsClient:    c,
+		bucket:       s.cfg.Bucket,
+		bucketPrefix: s.cfg.BucketPrefix,
 	}
 
 	seq, err := newSpannerCoordinator(ctx, s.cfg.Spanner, uint64(opts.PushbackMaxOutstanding()))
@@ -212,13 +216,24 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 		return nil, nil, fmt.Errorf("failed to create Spanner coordinator: %v", err)
 	}
 
+	a, lr, err := s.newAppender(ctx, gs, seq, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &tessera.Appender{
+		Add: a.Add,
+	}, lr, nil
+}
+
+// newAppender creates and initialises a tessera.Appender struct with the provided underlying storage implementations.
+func (s *Storage) newAppender(ctx context.Context, o objStore, seq *spannerCoordinator, opts *tessera.AppendOptions) (*Appender, tessera.LogReader, error) {
+	if opts.CheckpointInterval() < minCheckpointInterval {
+		return nil, nil, fmt.Errorf("requested CheckpointInterval (%v) is less than minimum permitted %v", opts.CheckpointInterval(), minCheckpointInterval)
+	}
+
 	a := &Appender{
 		logStore: &logResourceStore{
-			objStore: &gcsStorage{
-				gcsClient:    c,
-				bucket:       s.cfg.Bucket,
-				bucketPrefix: s.cfg.BucketPrefix,
-			},
+			objStore:    o,
 			entriesPath: opts.EntriesPath(),
 		},
 		sequencer: seq,
@@ -242,12 +257,13 @@ func (s *Storage) Appender(ctx context.Context, opts *tessera.AppendOptions) (*t
 		return nil, nil, fmt.Errorf("failed to initialise log storage: %v", err)
 	}
 
-	go a.sequencerJob(ctx)
-	go a.publisherJob(ctx, opts.CheckpointInterval())
+	go a.integrateEntriesJob(ctx)
+	go a.publishCheckpointJob(ctx, opts.CheckpointInterval())
+	if i := opts.GarbageCollectionInterval(); i > 0 {
+		go a.garbageCollectorJob(ctx, i)
+	}
 
-	return &tessera.Appender{
-		Add: a.Add,
-	}, reader, nil
+	return a, reader, nil
 }
 
 // Appender is an implementation of the Tessera appender lifecycle contract.
@@ -270,9 +286,10 @@ func (a *Appender) Add(ctx context.Context, e *tessera.Entry) tessera.IndexFutur
 	return a.queue.Add(ctx, e)
 }
 
-// sequencerJob is a long-running function which handles the periodic integration of sequenced entries.
+// integrateEntriesJob periodically append newly sequenced entries.
+//
 // Blocks until ctx is done.
-func (a *Appender) sequencerJob(ctx context.Context) {
+func (a *Appender) integrateEntriesJob(ctx context.Context) {
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
 	for {
@@ -283,15 +300,15 @@ func (a *Appender) sequencerJob(ctx context.Context) {
 		}
 
 		func() {
-			ctx, span := tracer.Start(ctx, "tessera.storage.gcp.sequenceTask")
+			ctx, span := tracer.Start(ctx, "tessera.storage.gcp.integrateEntriesJob")
 			defer span.End()
 
 			// Don't quickloop for now, it causes issues updating checkpoint too frequently.
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
 
-			if _, err := a.sequencer.consumeEntries(cctx, DefaultIntegrationSizeLimit, a.appendEntries, false); err != nil {
-				klog.Errorf("integrate: %v", err)
+			if _, err := a.sequencer.consumeEntries(cctx, DefaultIntegrationSizeLimit, a.integrateEntries, false); err != nil {
+				klog.Errorf("integrateEntriesJob: %v", err)
 				return
 			}
 			select {
@@ -302,9 +319,11 @@ func (a *Appender) sequencerJob(ctx context.Context) {
 	}
 }
 
-// publisherJob is a long-running function which handles the periodic publishing of checkpoints.
+// publishCheckpointJob periodically attempts to publish a new checkpoint representing the current state
+// of the tree, once per interval.
+//
 // Blocks until ctx is done.
-func (a *Appender) publisherJob(ctx context.Context, i time.Duration) {
+func (a *Appender) publishCheckpointJob(ctx context.Context, i time.Duration) {
 	t := time.NewTicker(i)
 	defer t.Stop()
 	for {
@@ -315,13 +334,53 @@ func (a *Appender) publisherJob(ctx context.Context, i time.Duration) {
 		case <-t.C:
 		}
 		func() {
-			ctx, span := tracer.Start(ctx, "tessera.storage.gcp.publishTask")
+			ctx, span := tracer.Start(ctx, "tessera.storage.gcp.publishCheckpointJob")
 			defer span.End()
-			if err := a.sequencer.publishTree(ctx, i, a.publishCheckpoint); err != nil {
+			if err := a.sequencer.publishCheckpoint(ctx, i, a.publishCheckpoint); err != nil {
 				klog.Warningf("publishCheckpoint failed: %v", err)
 			}
 		}()
 	}
+}
+
+// garbageCollectorJob is a long-running function which handles the removal of obsolete partial tiles
+// and entry bundles.
+// Blocks until ctx is done.
+func (a *Appender) garbageCollectorJob(ctx context.Context, i time.Duration) {
+	t := time.NewTicker(i)
+	defer t.Stop()
+
+	// Entirely arbitrary number.
+	maxBundlesPerRun := uint(100)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		func() {
+			ctx, span := tracer.Start(ctx, "tessera.storage.gcp.garbageCollectTask")
+			defer span.End()
+
+			// Figure out the size of the latest published checkpoint - we can't be removing partial tiles implied by
+			// that checkpoint just because we've done an integration and know about a larger (but as yet unpublished)
+			// checkpoint!
+			cp, err := a.logStore.getCheckpoint(ctx)
+			if err != nil {
+				klog.Warningf("Failed to get published checkpoint: %v", err)
+			}
+			_, pubSize, _, err := parse.CheckpointUnsafe(cp)
+			if err != nil {
+				klog.Warningf("Failed to parse published checkpoint: %v", err)
+			}
+
+			if err := a.sequencer.garbageCollect(ctx, pubSize, maxBundlesPerRun, a.logStore.objStore.deleteObjectsWithPrefix); err != nil {
+				klog.Warningf("GarbageCollect failed: %v", err)
+			}
+		}()
+	}
+
 }
 
 // init ensures that the storage represents a log in a valid state.
@@ -333,7 +392,7 @@ func (a *Appender) init(ctx context.Context) error {
 			// framework which prevents the tree from rolling backwards or otherwise forking).
 			cctx, c := context.WithTimeout(ctx, 10*time.Second)
 			defer c()
-			if _, err := a.sequencer.consumeEntries(cctx, DefaultIntegrationSizeLimit, a.appendEntries, true); err != nil {
+			if _, err := a.sequencer.consumeEntries(cctx, DefaultIntegrationSizeLimit, a.integrateEntries, true); err != nil {
 				return fmt.Errorf("forced integrate: %v", err)
 			}
 			select {
@@ -372,6 +431,7 @@ func (a *Appender) publishCheckpoint(ctx context.Context, size uint64, root []by
 type objStore interface {
 	getObject(ctx context.Context, obj string) ([]byte, int64, error)
 	setObject(ctx context.Context, obj string, data []byte, cond *gcs.Conditions, contType string, cacheCtl string) error
+	deleteObjectsWithPrefix(ctx context.Context, prefix string) error
 }
 
 // logResourceStore knows how to read and write entries which represent a tiles log inside an objStore.
@@ -475,9 +535,11 @@ func (s *logResourceStore) setEntryBundle(ctx context.Context, bundleIndex uint6
 	return nil
 }
 
-// appendEntries incorporates the provided entries into the log starting at fromSeq.
-func (a *Appender) appendEntries(ctx context.Context, fromSeq uint64, entries []storage.SequencedEntry) ([]byte, error) {
-	ctx, span := tracer.Start(ctx, "tessera.storage.gcp.appendEntries")
+// integrateEntries appends the provided entries into the log starting at fromSeq.
+//
+// Returns the new root hash of the log with the entries added.
+func (a *Appender) integrateEntries(ctx context.Context, fromSeq uint64, entries []storage.SequencedEntry) ([]byte, error) {
+	ctx, span := tracer.Start(ctx, "tessera.storage.gcp.integrateEntries")
 	defer span.End()
 
 	var newRoot []byte
@@ -665,12 +727,14 @@ func (s *spannerCoordinator) initDB(ctx context.Context, spannerDB string) error
 			"CREATE TABLE IF NOT EXISTS Seq (id INT64 NOT NULL, seq INT64 NOT NULL, v BYTES(MAX),) PRIMARY KEY (id, seq)",
 			"CREATE TABLE IF NOT EXISTS IntCoord (id INT64 NOT NULL, seq INT64 NOT NULL, rootHash BYTES(32)) PRIMARY KEY (id)",
 			"CREATE TABLE IF NOT EXISTS PubCoord (id INT64 NOT NULL, publishedAt TIMESTAMP NOT NULL) PRIMARY KEY (id)",
+			"CREATE TABLE IF NOT EXISTS GCCoord (id INT64 NOT NULL, fromSize INT64 NOT NULL) PRIMARY KEY (id)",
 		},
 		[][]*spanner.Mutation{
 			{spanner.Insert("Tessera", []string{"id", "compatibilityVersion"}, []any{0, SchemaCompatibilityVersion})},
 			{spanner.Insert("SeqCoord", []string{"id", "next"}, []any{0, 0})},
 			{spanner.Insert("IntCoord", []string{"id", "seq", "rootHash"}, []any{0, 0, rfc6962.DefaultHasher.EmptyRoot()})},
 			{spanner.Insert("PubCoord", []string{"id", "publishedAt"}, []any{0, time.Unix(0, 0)})},
+			{spanner.Insert("GCCoord", []string{"id", "fromSize"}, []any{0, 0})},
 		},
 	)
 }
@@ -783,7 +847,7 @@ func (s *spannerCoordinator) assignEntries(ctx context.Context, entries []*tesse
 //
 // Returns true if some entries were consumed as a weak signal that there may be further entries waiting to be consumed.
 func (s *spannerCoordinator) consumeEntries(ctx context.Context, limit uint64, f consumeFunc, forceUpdate bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "tessera.storage.gcp.assignEntries")
+	ctx, span := tracer.Start(ctx, "tessera.storage.gcp.consumeEntries")
 	defer span.End()
 
 	didWork := false
@@ -798,17 +862,34 @@ func (s *spannerCoordinator) consumeEntries(ctx context.Context, limit uint64, f
 		if err := row.Columns(&fromSeq, &rootHash); err != nil {
 			return fmt.Errorf("failed to read integration coordination info: %v", err)
 		}
-		klog.V(1).Infof("Consuming from %d", fromSeq)
+
+		// See how much potential work there is to do and trim our limit accordingly.
+		row, err = txn.ReadRow(ctx, "SeqCoord", spanner.Key{0}, []string{"next"})
+		if err != nil {
+			return err
+		}
+		var endSeq int64 // Spanner doesn't support uint64
+		if err := row.Columns(&endSeq); err != nil {
+			return fmt.Errorf("failed to read sequence coordination info: %v", err)
+		}
+		if endSeq == fromSeq {
+			return nil
+		}
+		if l := fromSeq + int64(limit); l < endSeq {
+			endSeq = l
+		}
+
+		klog.V(1).Infof("Consuming bundles start from %d to at most %d", fromSeq, endSeq)
 
 		// Now read the sequenced starting at the index we got above.
 		rows := txn.ReadWithOptions(ctx, "Seq",
-			spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, fromSeq + int64(limit)}},
+			spanner.KeyRange{Start: spanner.Key{0, fromSeq}, End: spanner.Key{0, endSeq}},
 			[]string{"seq", "v"},
 			&spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
 		defer rows.Stop()
 
 		seqsConsumed := []int64{}
-		entries := make([]storage.SequencedEntry, 0, limit)
+		entries := make([]storage.SequencedEntry, 0, endSeq-fromSeq)
 		orderCheck := fromSeq
 		for {
 			row, err := rows.Next()
@@ -901,12 +982,12 @@ func (s *spannerCoordinator) nextIndex(ctx context.Context) (uint64, error) {
 	return uint64(nextSeq), nil
 }
 
-// publishTree checks when the last checkpoint was published, and if it was more than minAge ago, calls the provided
+// publishCheckpoint checks when the last checkpoint was published, and if it was more than minAge ago, calls the provided
 // function to publish a new one.
 //
 // This function uses PubCoord with an exclusive lock to guarantee that only one tessera instance can attempt to publish
 // a checkpoint at any given time.
-func (s *spannerCoordinator) publishTree(ctx context.Context, minAge time.Duration, f func(context.Context, uint64, []byte) error) error {
+func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minAge time.Duration, f func(context.Context, uint64, []byte) error) error {
 	if _, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
 		pRow, err := txn.ReadRowWithOptions(ctx, "PubCoord", spanner.Key{0}, []string{"publishedAt"}, &spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
 		if err != nil {
@@ -919,11 +1000,11 @@ func (s *spannerCoordinator) publishTree(ctx context.Context, minAge time.Durati
 
 		cpAge := time.Since(pubAt)
 		if cpAge < minAge {
-			klog.V(1).Infof("publishTree: last checkpoint published %s ago (< required %s), not publishing new checkpoint", cpAge, minAge)
+			klog.V(1).Infof("publishCheckpoint: last checkpoint published %s ago (< required %s), not publishing new checkpoint", cpAge, minAge)
 			return nil
 		}
 
-		klog.V(1).Infof("publishTree: updating checkpoint (replacing %s old checkpoint)", cpAge)
+		klog.V(1).Infof("publishCheckpoint: updating checkpoint (replacing %s old checkpoint)", cpAge)
 
 		// Can't just use currentTree() here as the spanner emulator doesn't do nested transactions, so do it manually:
 		row, err := txn.ReadRow(ctx, "IntCoord", spanner.Key{0}, []string{"seq", "rootHash"})
@@ -947,6 +1028,75 @@ func (s *spannerCoordinator) publishTree(ctx context.Context, minAge time.Durati
 		return err
 	}
 	return nil
+}
+
+// garbageCollect will identify up to maxBundles unneeded partial entry bundles (and any unneeded partial tiles which sit above them in the tree) and
+// call the provided function to remove them.
+//
+// Uses the `GCCoord` table to ensure that only one binary is actively garbage collecting at any given time, and to track progress so that we don't
+// needlessly attempt to GC over regions which have already been cleaned.
+func (s *spannerCoordinator) garbageCollect(ctx context.Context, treeSize uint64, maxBundles uint, deleteWithPrefix func(ctx context.Context, prefix string) error) error {
+	_, err := s.dbPool.ReadWriteTransaction(ctx, func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+		row, err := txn.ReadRowWithOptions(ctx, "GCCoord", spanner.Key{0}, []string{"fromSize"}, &spanner.ReadOptions{LockHint: spannerpb.ReadRequest_LOCK_HINT_EXCLUSIVE})
+		if err != nil {
+			return fmt.Errorf("failed to read GCCoord: %w", err)
+		}
+		var fs int64
+		if err := row.Columns(&fs); err != nil {
+			return fmt.Errorf("failed to parse row contents: %v", err)
+		}
+		fromSize := uint64(fs)
+
+		if fromSize == treeSize {
+			return nil
+		}
+
+		d := uint(0)
+		eg := errgroup.Group{}
+		// GC the tree in "vertical" chunks defined by entry bundles.
+		for ri := range layout.Range(fromSize, treeSize-fromSize, treeSize) {
+			// Only known-full bundles are in-scope for for GC, so exit if the current bundle is partial or
+			// we've reached our limit of chunks.
+			if ri.Partial > 0 || d > maxBundles {
+				break
+			}
+
+			// GC any partial versions of the entry bundle itself and the tile which sits immediately above it.
+			eg.Go(func() error { return deleteWithPrefix(ctx, layout.EntriesPath(ri.Index, 0)+".p/") })
+			eg.Go(func() error { return deleteWithPrefix(ctx, layout.TilePath(0, ri.Index, 0)+".p/") })
+			fromSize += uint64(ri.N)
+			d++
+
+			// Now consider (only) the part of the tree which sits above the bundle.
+			// We'll walk up the parent tiles for as a long as we're tracing the right-hand
+			// edge of a perfect subtree.
+			// This gives the property we'll only visit each parent tile once, rather than up to 256 times.
+			pL, pIdx := uint64(0), ri.Index
+			for isLastLeafInParent(pIdx) {
+				// Move our coordinates up to the parent
+				pL, pIdx = pL+1, pIdx>>layout.TileHeight
+				// GC any partial versions of the parent tile.
+				eg.Go(func() error { return deleteWithPrefix(ctx, layout.TilePath(pL, pIdx, 0)+".p/") })
+
+			}
+		}
+		if err := eg.Wait(); err != nil {
+			return fmt.Errorf("failed to delete one or more objects: %v", err)
+		}
+
+		if err := txn.BufferWrite([]*spanner.Mutation{spanner.Update("GCCoord", []string{"id", "fromSize"}, []any{0, int64(fromSize)})}); err != nil {
+			return err
+		}
+
+		return nil
+	})
+	return err
+}
+
+// isLastLeafInParent returns true if a tile with the provided index is the final child node of a
+// (hypothetical) full parent tile.
+func isLastLeafInParent(i uint64) bool {
+	return i%layout.TileWidth == layout.TileWidth-1
 }
 
 // gcsStorage knows how to store and retrieve objects from GCS.
@@ -1036,6 +1186,37 @@ func (s *gcsStorage) setObject(ctx context.Context, objName string, data []byte,
 		return fmt.Errorf("failed to close write on %q: %v", objName, err)
 	}
 	return nil
+}
+
+// deleteObjectsWithPrefix removes any objects with the provided prefix from GCS.
+func (s *gcsStorage) deleteObjectsWithPrefix(ctx context.Context, objPrefix string) error {
+	ctx, span := tracer.Start(ctx, "tessera.storage.gcp.deleteObject")
+	defer span.End()
+
+	if s.bucketPrefix != "" {
+		objPrefix = filepath.Join(s.bucketPrefix, objPrefix)
+	}
+	span.SetAttributes(objectPathKey.String(objPrefix))
+
+	bkt := s.gcsClient.Bucket(s.bucket)
+
+	errs := []error(nil)
+	it := bkt.Objects(ctx, &gcs.Query{Prefix: objPrefix})
+	for {
+		attr, err := it.Next()
+		if err != nil {
+			if err == iterator.Done {
+				break
+			}
+			return err
+		}
+		klog.V(2).Infof("Deleting object %s", attr.Name)
+		if err := bkt.Object(attr.Name).Delete(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // MigrationWriter creates a new GCP storage for the MigrationTarget lifecycle mode.
