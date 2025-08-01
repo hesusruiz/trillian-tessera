@@ -19,6 +19,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.8.1
 	github.com/google/go-cmp v0.7.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/mattn/go-sqlite3 v1.14.14
 	github.com/rivo/tview v0.0.0-20240625185742-b0a7293b8130
 	github.com/transparency-dev/formats v0.0.0-20250421220931-bb8ad4d07c26
 	github.com/transparency-dev/merkle v0.0.2
