@@ -147,9 +147,13 @@ func (a *appender) Add(ctx context.Context, e *tessera.Entry) tessera.IndexFutur
 	if _, err := tx.ExecContext(ctx, "UPDATE SeqCoord SET next=? WHERE id=0", size); err != nil {
 		return AddResult(0, fmt.Errorf("failed to update SeqCoord: %v", err))
 	}
+
+	// Commit the updates
 	if err := tx.Commit(); err != nil {
 		return AddResult(0, fmt.Errorf("failed to commit transaction: %v", err))
 	}
+
+	// Return a function that returns immediately the index and no error.
 	return AddResult(next, nil)
 }
 
